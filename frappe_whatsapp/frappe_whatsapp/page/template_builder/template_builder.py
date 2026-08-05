@@ -41,8 +41,44 @@ BUTTON_TYPE_TO_KIND = {v: k for k, v in BUTTON_KIND_MAP.items()}
 LOCKED_STATUSES = {"APPROVED"}
 
 
+def parse_list(val):
+	"""Parse a JSON array string or comma-separated string into a list of strings."""
+	if not val:
+		return []
+	if isinstance(val, list):
+		return [str(v) for v in val]
+	if isinstance(val, str):
+		val = val.strip()
+		if not val:
+			return []
+		if val.startswith("[") and val.endswith("]"):
+			try:
+				parsed = json.loads(val)
+				if isinstance(parsed, list):
+					return [str(v) for v in parsed]
+			except (ValueError, TypeError):
+				pass
+		return [v.strip() for v in val.split(",")]
+	return []
+
+
+def serialize_list(lst):
+	"""Serialize a list of strings to JSON string if any element contains a comma, else comma-separated string."""
+	if not lst:
+		return None
+	clean = [str(v).strip() for v in lst]
+	if not any(clean):
+		return None
+	if any("," in v for v in clean):
+		return json.dumps(clean)
+	return ",".join(clean)
+
+
 def _is_locked(doc):
-	return bool(doc.id) or (doc.status or "").upper() in LOCKED_STATUSES
+	has_unsupported_buttons = any(
+		(b.button_type or "") not in BUTTON_TYPE_TO_KIND for b in (doc.get("buttons") or [])
+	)
+	return bool(doc.id) or (doc.status or "").upper() in LOCKED_STATUSES or has_unsupported_buttons
 
 
 @frappe.whitelist()
@@ -120,11 +156,14 @@ def get_sample_record(doctype, fieldnames=None):
 	if not frappe.has_permission(doctype, "read"):
 		frappe.throw(_("You are not permitted to read {0}").format(doctype))
 
-	names = frappe.get_list(doctype, fields=["name"], order_by="modified desc", limit=1)
-	if not names:
-		return {"record": None, "values": {}}
-
-	doc = frappe.get_doc(doctype, names[0]["name"])
+	meta = frappe.get_meta(doctype)
+	if meta.issingle:
+		doc = frappe.get_single(doctype)
+	else:
+		names = frappe.get_list(doctype, fields=["name"], order_by="modified desc", limit=1)
+		if not names:
+			return {"record": None, "values": {}}
+		doc = frappe.get_doc(doctype, names[0]["name"])
 
 	# `fieldnames` may arrive as a real list, a JSON-array string (how the JS
 	# client's array arg is form-encoded), or a plain comma string.
@@ -159,20 +198,19 @@ def load_template(name):
 	doc = frappe.get_doc("WhatsApp Templates", name)
 	doc.check_permission("read")
 
-	sample_values = doc.sample_values.split(",") if doc.sample_values else []
-	field_names = doc.field_names.split(",") if doc.field_names else []
+	sample_values = parse_list(doc.sample_values)
+	field_names = parse_list(doc.field_names)
 
 	buttons = []
 	for b in doc.buttons:
 		kind = BUTTON_TYPE_TO_KIND.get(b.button_type)
-		if not kind:
-			continue
 		buttons.append({
-			"kind": kind,
+			"kind": kind or b.button_type,
 			"label": b.button_label,
 			"url": b.website_url,
 			"phone_number": b.phone_number,
 			"example": b.example_url,
+			"unsupported": not bool(kind),
 		})
 
 	return {
@@ -189,8 +227,8 @@ def load_template(name):
 			"sample": doc.sample or "",
 		},
 		"for_doctype": doc.for_doctype,
-		"sample_values": [v.strip() for v in sample_values],
-		"field_names": [v.strip() for v in field_names],
+		"sample_values": sample_values,
+		"field_names": field_names,
 		"buttons": buttons,
 		"status": doc.status,
 		"has_meta_id": bool(doc.id),
@@ -232,24 +270,24 @@ def _apply_payload(doc, data):
 	if header_type == "TEXT" and (header.get("text") or "").strip():
 		doc.header_type = "TEXT"
 		doc.header = header["text"].strip()
-	elif header_type in ("IMAGE", "DOCUMENT") and (header.get("sample") or "").strip():
+		if (header.get("sample") or "").strip():
+			doc.sample = header["sample"].strip()
+	elif header_type in ("IMAGE", "DOCUMENT"):
 		doc.header_type = header_type
-		doc.sample = header["sample"].strip()
+		if (header.get("sample") or "").strip():
+			doc.sample = header["sample"].strip()
 
 	# Sample values (Meta review) + field names (runtime data binding), both
-	# comma-separated and ordered by {{1}}, {{2}}, ...
-	sample_values = data.get("sample_values") or []
-	if isinstance(sample_values, str):
-		sample_values = sample_values.split(",")
-	doc.sample_values = ",".join(str(v).strip() for v in sample_values) if sample_values else None
+	# serialized cleanly and ordered by {{1}}, {{2}}, ...
+	sample_values = parse_list(data.get("sample_values"))
+	doc.sample_values = serialize_list(sample_values)
 
-	field_names = data.get("field_names") or []
-	if isinstance(field_names, str):
-		field_names = field_names.split(",")
-	# Only persist field_names if at least one is set (otherwise leave blank so
-	# send-time falls back to sample_values, matching existing behaviour).
-	field_names = [str(v).strip() for v in field_names]
-	doc.field_names = ",".join(field_names) if any(field_names) else None
+	raw_field_names = parse_list(data.get("field_names"))
+	# Only persist field_names if EVERY variable is mapped, matching existing behaviour requirement.
+	if raw_field_names and all(f.strip() for f in raw_field_names) and len(raw_field_names) == len(sample_values):
+		doc.field_names = serialize_list(raw_field_names)
+	else:
+		doc.field_names = None
 
 	# Buttons — rebuild the child table from scratch.
 	doc.set("buttons", [])
@@ -276,8 +314,18 @@ def _validate(data):
 	if not re.fullmatch(r"[a-z0-9_]+", template_name):
 		# Meta's naming rule; also mirrored client-side.
 		frappe.throw(_("Template Name may only contain lowercase letters, numbers and underscores"))
-	if not (data.get("body") or "").strip():
+	body_text = (data.get("body") or "").strip()
+	if not body_text:
 		frappe.throw(_("Body text is required"))
+
+	# Check contiguous variable numbering starting from {{1}}
+	vars_found = [int(m) for m in re.findall(r"\{\{\s*(\d+)\s*\}\}", body_text)]
+	if vars_found:
+		unique_vars = sorted(list(set(vars_found)))
+		expected = list(range(1, len(unique_vars) + 1))
+		if unique_vars != expected:
+			frappe.throw(_("Variables in body must be numbered consecutively starting at {{1}} (e.g. {{1}}, {{2}})"))
+
 	category = (data.get("category") or "").strip()
 	if category not in CATEGORY_OPTIONS:
 		frappe.throw(_("Invalid category: {0}").format(category))
@@ -342,3 +390,35 @@ def save_template(payload, submit=0, name=None):
 		"submitted": bool(submit),
 		"updated": is_update,
 	}
+
+
+@frappe.whitelist()
+def sync_template(name):
+	"""Refresh Meta status for a single template document."""
+	if not name:
+		return {"name": None, "status": None}
+	doc = frappe.get_doc("WhatsApp Templates", name)
+	doc.check_permission("read")
+	if not doc.id or not doc.whatsapp_account:
+		return {"name": doc.name, "status": doc.status}
+
+	account = frappe.get_doc("WhatsApp Account", doc.whatsapp_account)
+	token = account.get_password("token")
+	url = account.url
+	version = account.version
+
+	headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
+	try:
+		from frappe.integrations.utils import make_request
+		response = make_request(
+			"GET",
+			f"{url}/{version}/{doc.id}",
+			headers=headers,
+		)
+		if response and response.get("status"):
+			doc.status = response["status"]
+			doc.db_update()
+	except Exception:
+		pass
+
+	return {"name": doc.name, "status": doc.status}

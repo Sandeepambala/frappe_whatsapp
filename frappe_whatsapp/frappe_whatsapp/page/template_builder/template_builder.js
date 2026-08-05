@@ -14,6 +14,7 @@
  */
 
 frappe.pages['template-builder'].on_page_load = function (wrapper) {
+	frappe.require('/assets/frappe_whatsapp/css/template_builder.css');
 	const page = frappe.ui.make_app_page({
 		parent: wrapper,
 		title: 'Template Builder',
@@ -70,6 +71,15 @@ class TemplateBuilder {
 			this.boot = { categories: ['UTILITY', 'MARKETING', 'AUTHENTICATION'], header_types: ['TEXT', 'IMAGE', 'DOCUMENT'], languages: [{ name: 'en', language_name: 'English' }], accounts: [], has_account: false };
 		}
 		if (this.boot.default_account) this.state.whatsapp_account = this.boot.default_account;
+
+		try {
+			this.doctypeList = await frappe.call({
+				method: 'frappe.client.get_list',
+				args: { doctype: 'DocType', fields: ['name'], filters: { istable: 0, issingle: 0 }, limit_page_length: 0 },
+			}).then((r) => (r.message || []).map((d) => d.name));
+		} catch (e) {
+			this.doctypeList = [];
+		}
 
 		if (this.editName) {
 			try {
@@ -491,14 +501,22 @@ class TemplateBuilder {
 	}
 
 	renderButtonRow(b, i) {
-		const kindMeta = {
-			quick_reply: { cls: 'k-reply', label: __('REPLY') },
-			url: { cls: 'k-url', label: __('VISIT SITE') },
-			phone: { cls: 'k-call', label: __('CALL') },
-		}[b.kind] || { cls: 'k-reply', label: b.kind };
+		const kindMeta = b.unsupported
+			? { cls: 'k-reply', label: b.kind || __('UNSUPPORTED') }
+			: ({
+				quick_reply: { cls: 'k-reply', label: __('REPLY') },
+				url: { cls: 'k-url', label: __('VISIT SITE') },
+				phone: { cls: 'k-call', label: __('CALL') },
+			}[b.kind] || { cls: 'k-reply', label: b.kind });
 		let fields = `<input class="wtb-input" data-btnfield="label" data-i="${i}" placeholder="${__('Button text')}" value="${frappe.utils.escape_html(b.label || '')}">`;
-		if (b.kind === 'url') fields += `<input class="wtb-input" data-btnfield="url" data-i="${i}" placeholder="https://…/{{1}}" value="${frappe.utils.escape_html(b.url || '')}">`;
-		else if (b.kind === 'phone') fields += `<input class="wtb-input" data-btnfield="phone_number" data-i="${i}" placeholder="+91 80 0000 0000" value="${frappe.utils.escape_html(b.phone_number || '')}">`;
+		if (b.kind === 'url') {
+			fields += `<input class="wtb-input" data-btnfield="url" data-i="${i}" placeholder="https://…/{{1}}" value="${frappe.utils.escape_html(b.url || '')}">`;
+			if (b.url && b.url.includes('{{')) {
+				fields += `<input class="wtb-input" data-btnfield="example" data-i="${i}" placeholder="${__('URL Example (e.g. https://example.com/orders/123)')}" value="${frappe.utils.escape_html(b.example || '')}">`;
+			}
+		} else if (b.kind === 'phone') {
+			fields += `<input class="wtb-input" data-btnfield="phone_number" data-i="${i}" placeholder="+91 80 0000 0000" value="${frappe.utils.escape_html(b.phone_number || '')}">`;
+		}
 		return `
 			<div class="wtb-btn-row">
 				<span class="wtb-grip" style="cursor:grab;">⠿</span>
@@ -571,14 +589,25 @@ class TemplateBuilder {
 			</div>`;
 	}
 
+	isContiguousVars(vars) {
+		if (!vars || !vars.length) return true;
+		const nums = vars.map(Number);
+		for (let i = 0; i < nums.length; i++) {
+			if (nums[i] !== i + 1) return false;
+		}
+		return true;
+	}
+
 	complianceChecks() {
 		const s = this.state;
 		const vars = this.detectVars(s.body);
 		const allSamples = vars.every((n) => this.sampleFor(n) !== '');
 		const nameOk = /^[a-z0-9_]+$/.test((s.template_name || '').trim());
+		const contiguousOk = this.isContiguousVars(vars);
 		return [
 			{ label: __('Template name is valid'), ok: nameOk },
 			{ label: __('Body present & within limit'), ok: !!s.body.trim() && s.body.length <= WA.BODY_MAX },
+			{ label: __('Variables numbered consecutively starting at {{1}}'), ok: contiguousOk },
 			{ label: __('All variables have samples'), ok: allSamples },
 			{ label: __('WhatsApp account selected'), ok: !!s.whatsapp_account },
 		];
@@ -677,22 +706,17 @@ class TemplateBuilder {
 		const self = this;
 		const $inp = this.$body.find('[data-doctype-link]');
 		if (!$inp.length) return;
-		$inp.on('change blur', async function () {
+		$inp.off('change blur').on('change blur', async function () {
 			const val = ($(this).val() || '').trim();
 			if (val === self.state.for_doctype) return;
 			self.state.for_doctype = val;
 			await self.loadDoctypeFields(val);
 			self.render();
 		});
-		// Lightweight awesomplete on DocType names.
-		frappe.call('frappe.client.get_list', {
-			doctype: 'DocType', fields: ['name'], filters: { istable: 0, issingle: 0 }, limit_page_length: 0,
-		}).then((r) => {
-			const names = (r.message || []).map((d) => d.name);
-			if (window.Awesomplete) {
-				new window.Awesomplete($inp.get(0), { list: names, minChars: 1, maxItems: 15, autoFirst: true });
-			}
-		}).catch(() => {});
+		if (window.Awesomplete && $inp.get(0) && !$inp.data('awesomplete-attached')) {
+			new window.Awesomplete($inp.get(0), { list: this.doctypeList || [], minChars: 1, maxItems: 15, autoFirst: true });
+			$inp.data('awesomplete-attached', true);
+		}
 	}
 
 	openFileUpload() {
@@ -722,12 +746,39 @@ class TemplateBuilder {
 	/* ---- partial refreshes ---- */
 
 	onBodyInput(val) {
-		const prevVars = this.detectVars(this.state.body).join(',');
 		this.state.body = val;
-		const nowVars = this.detectVars(val).join(',');
-		if (prevVars !== nowVars) { this.render(); return; }
 		this.updateBodyCount(val);
+		this.softRefreshSamples();
 		this.softRefreshPreview();
+		this.softRefreshCompliance();
+	}
+
+	softRefreshSamples() {
+		const vars = this.detectVars(this.state.body);
+		const $existingCard = this.$body.find('.wtb-sample-rows').closest('.wtb-card');
+		if (vars.length) {
+			const newCardHtml = this.renderSamples();
+			if ($existingCard.length) {
+				$existingCard.replaceWith(newCardHtml);
+			} else {
+				const $bodyBlock = this.$body.find('[data-block="body"]');
+				if ($bodyBlock.length) $bodyBlock.after(newCardHtml);
+			}
+			const self = this;
+			this.$body.find('[data-sample]').off('input').on('input', function () {
+				self.state.samples[String($(this).data('sample'))] = $(this).val();
+				self.softRefreshPreview();
+			});
+			this.$body.find('[data-field-map]').off('change').on('change', function () {
+				const n = String($(this).data('field-map'));
+				const fieldname = $(this).val();
+				self.state.fields[n] = fieldname;
+				if (fieldname) self.fillSampleFromField(n, fieldname);
+			});
+			this.$body.find('[data-fill-all]').off('click').on('click', () => self.fillAllSamplesFromFields());
+		} else if ($existingCard.length) {
+			$existingCard.remove();
+		}
 	}
 
 	updateBodyCount(val) {
@@ -817,10 +868,8 @@ class TemplateBuilder {
 			buttons: s.components.buttons
 				? s.buttons.filter((b) => (b.label || '').trim()).map((b) => ({
 					kind: b.kind, label: b.label, url: b.url, phone_number: b.phone_number,
-					// Meta wants a full example URL for dynamic URL buttons. Keep a
-					// loaded/duplicated example as-is, else derive one from the URL.
 					example: b.kind === 'url' && b.url && b.url.includes('{{')
-						? (b.example || b.url.replace(/\{\{\s*\d+\s*\}\}/g, encodeURIComponent(this.sampleFor('1') || 'example')))
+						? (b.example || null)
 						: null,
 				}))
 				: [],
@@ -833,11 +882,34 @@ class TemplateBuilder {
 		if (!/^[a-z0-9_]+$/.test(s.template_name.trim())) { frappe.show_alert({ message: __('Template Name may only contain lowercase letters, numbers and underscores'), indicator: 'red' }); return false; }
 		if (!s.body.trim()) { frappe.show_alert({ message: __('Body text is required'), indicator: 'red' }); return false; }
 		if (s.body.length > WA.BODY_MAX) { frappe.show_alert({ message: __('Body exceeds {0} characters', [WA.BODY_MAX]), indicator: 'red' }); return false; }
+		
+		const vars = this.detectVars(s.body);
+		if (!this.isContiguousVars(vars)) {
+			frappe.show_alert({ message: __('Variables must be numbered consecutively starting at {{1}} (e.g. {{1}}, {{2}})'), indicator: 'red' });
+			return false;
+		}
+
+		if (s.for_doctype && vars.length > 0) {
+			const mappedCount = vars.filter((n) => this.fieldFor(n)).length;
+			if (mappedCount > 0 && mappedCount < vars.length) {
+				frappe.show_alert({ message: __('Either map all variables to fields or leave all unmapped'), indicator: 'red' });
+				return false;
+			}
+		}
+
+		if (s.components.buttons) {
+			for (const b of s.buttons) {
+				if (b.kind === 'url' && b.url && b.url.includes('{{') && submit && !(b.example || '').trim()) {
+					frappe.show_alert({ message: __('Add an example URL for the website button'), indicator: 'red' });
+					return false;
+				}
+			}
+		}
+
 		if (s.components.header && s.header.type !== 'TEXT' && !s.header.sample && submit) {
 			frappe.show_alert({ message: __('Upload a {0} for the header, or remove it', [s.header.type.toLowerCase()]), indicator: 'red' }); return false;
 		}
 		if (submit) {
-			const vars = this.detectVars(s.body);
 			const missing = vars.filter((n) => this.sampleFor(n) === '');
 			if (missing.length) { frappe.show_alert({ message: __('Add sample values for: {0}', [missing.map((n) => '{{' + n + '}}').join(', ')]), indicator: 'red' }); return false; }
 			if (!s.whatsapp_account) { frappe.show_alert({ message: __('Select a WhatsApp Account to submit'), indicator: 'red' }); return false; }
@@ -951,12 +1023,16 @@ class TemplateBuilder {
 		);
 	}
 
-	/** Pull latest template statuses from Meta, then reload this template. */
+	/** Pull latest status for this template from Meta. */
 	async syncStatus() {
-		frappe.dom.freeze(__('Syncing from Meta…'));
+		if (!this.editName) return;
+		frappe.dom.freeze(__('Syncing status from Meta…'));
 		try {
-			await frappe.call('frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates.fetch');
-			if (this.editName) await this.openTemplate(this.editName, { quiet: true });
+			await frappe.call({
+				method: `${WA.API}.sync_template`,
+				args: { name: this.editName },
+			});
+			await this.openTemplate(this.editName, { quiet: true });
 			frappe.show_alert({ message: __('Status refreshed'), indicator: 'green' }, 3);
 		} catch (e) {
 			console.error(e);

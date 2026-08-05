@@ -13,6 +13,27 @@ from frappe.desk.form.utils import get_pdf_link
 
 from frappe_whatsapp.utils import get_whatsapp_account
 
+def parse_list(val):
+    """Parse a JSON array string or comma-separated string into a list of strings."""
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [str(v) for v in val]
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return []
+        if val.startswith("[") and val.endswith("]"):
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    return [str(v) for v in parsed]
+            except (ValueError, TypeError):
+                pass
+        return [v.strip() for v in val.split(",")]
+    return []
+
+
 class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-committing-other-method -- get_settings() sets self._token/_url/_version/_business_id/_app_id/_headers as in-memory scratch for the outbound Meta HTTP call; they are not DocType fields and must not be persisted
     """Create whatsapp template."""
 
@@ -40,7 +61,7 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
     def set_whatsapp_account(self):
         """Set whatsapp account to default if missing"""
         if not self.whatsapp_account:
-            default_whatsapp_account = get_whatsapp_account()
+            default_whatsapp_account = get_whatsapp_account(account_type="outgoing")
             if default_whatsapp_account:
                 self.whatsapp_account = default_whatsapp_account.name
             elif not self.flags.get("skip_meta_submit"):
@@ -158,7 +179,7 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
             "text": self.template,
         }
         if self.sample_values:
-            body.update({"example": {"body_text": [self.sample_values.split(",")]}})
+            body.update({"example": {"body_text": [parse_list(self.sample_values)]}})
 
         data["components"].append(body)
         if self.header_type:
@@ -224,7 +245,7 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
             "text": self.template,
         }
         if self.sample_values:
-            body.update({"example": {"body_text": [self.sample_values.split(",")]}})
+            body.update({"example": {"body_text": [parse_list(self.sample_values)]}})
         data["components"].append(body)
         if self.header_type:
             data["components"].append(self.get_header())
@@ -382,11 +403,13 @@ def fetch():
                     elif component["type"] == "BODY":
                         doc.template = component["text"]
                         if component.get("example"):
-    			            # Check if 'body_text' exists before trying to access it
+                            # Check if 'body_text' exists before trying to access it
                             if component["example"].get("body_text"):
-                                doc.sample_values = ",".join(
-            	                    component["example"]["body_text"][0]
-                    	        )
+                                samples = component["example"]["body_text"][0]
+                                if any("," in str(s) for s in samples):
+                                    doc.sample_values = json.dumps(samples)
+                                else:
+                                    doc.sample_values = ",".join(samples)
 
                     # Update buttons
                     elif component["type"] == "BUTTONS":

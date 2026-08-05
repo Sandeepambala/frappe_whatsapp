@@ -296,3 +296,120 @@ class TestWhatsAppTemplates(IntegrationTestCase):
 
         doc.reload()
         self.assertEqual(doc.template, "Updated body text")
+
+    def test_partial_variable_mapping_not_persisted(self):
+        """Fix #1: Test partial variable mapping does not persist field_names."""
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import save_template
+        payload = {
+            "template_name": "test_tmpl_partial_map",
+            "body": "Hello {{1}}, order {{2}} for {{3}}",
+            "category": "UTILITY",
+            "language": "en",
+            "sample_values": ["Val1", "Val2", "Val3"],
+            "field_names": ["", "customer_name", ""],
+        }
+        res = save_template(payload, submit=0)
+        doc = frappe.get_doc("WhatsApp Templates", res["name"])
+        self.assertIsNone(doc.field_names)
+
+        # Full mapping persists
+        payload["field_names"] = ["name", "customer_name", "owner"]
+        res2 = save_template(payload, submit=0, name=res["name"])
+        doc2 = frappe.get_doc("WhatsApp Templates", res2["name"])
+        self.assertIsNotNone(doc2.field_names)
+
+    def test_comma_in_sample_values(self):
+        """Fix #2: Test sample values with commas are serialized as JSON and parsed cleanly."""
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import save_template, load_template
+        payload = {
+            "template_name": "test_tmpl_comma_sample",
+            "body": "Amount {{1}}, address {{2}}",
+            "category": "UTILITY",
+            "language": "en",
+            "sample_values": ["$1,234.00", "Main Street, NY"],
+        }
+        res = save_template(payload, submit=0)
+        doc = frappe.get_doc("WhatsApp Templates", res["name"])
+        self.assertTrue(doc.sample_values.startswith("["))
+
+        loaded = load_template(res["name"])
+        self.assertEqual(loaded["sample_values"], ["$1,234.00", "Main Street, NY"])
+
+    def test_non_contiguous_variables_rejected(self):
+        """Fix #3: Test non-contiguous body variables raise validation error."""
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import save_template
+        payload = {
+            "template_name": "test_tmpl_non_contiguous",
+            "body": "Hello {{1}}, your item {{3}} is ready",
+            "category": "UTILITY",
+            "language": "en",
+            "sample_values": ["Val1", "Val3"],
+        }
+        with self.assertRaises(frappe.ValidationError):
+            save_template(payload, submit=0)
+
+    def test_unsupported_buttons_locks_template(self):
+        """Fix #4: Test templates with unsupported button types like Flow are locked."""
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import load_template, save_template
+        doc = self._make_template_without_hooks(template_name="test_tmpl_flow_btn")
+        btn = doc.append("buttons", {"button_type": "Flow", "button_label": "Start Flow"})
+        btn.name = None
+        btn.insert(ignore_permissions=True)
+
+        loaded = load_template(doc.name)
+        self.assertTrue(loaded["locked"])
+        self.assertTrue(any(b["unsupported"] for b in loaded["buttons"]))
+
+        payload = {
+            "template_name": "test_tmpl_flow_btn",
+            "body": "Body text",
+            "category": "UTILITY",
+            "language": "en",
+        }
+        with self.assertRaises(frappe.ValidationError):
+            save_template(payload, submit=0, name=doc.name)
+
+    def test_text_header_sample_and_media_draft_preserved(self):
+        """Fix #5: Test TEXT header sample preservation and IMAGE header type preservation on draft save."""
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import save_template, load_template
+        payload = {
+            "template_name": "test_tmpl_hdr_preservation",
+            "body": "Body text",
+            "category": "UTILITY",
+            "language": "en",
+            "header": {"type": "TEXT", "text": "Header {{1}}", "sample": "HeaderSample"},
+        }
+        res = save_template(payload, submit=0)
+        doc = frappe.get_doc("WhatsApp Templates", res["name"])
+        self.assertEqual(doc.header_type, "TEXT")
+        self.assertEqual(doc.sample, "HeaderSample")
+
+        # Media draft without file sample retains header_type
+        payload["header"] = {"type": "IMAGE", "sample": ""}
+        res2 = save_template(payload, submit=0, name=res["name"])
+        doc2 = frappe.get_doc("WhatsApp Templates", res2["name"])
+        self.assertEqual(doc2.header_type, "IMAGE")
+
+    @patch("frappe.integrations.utils.make_request")
+    def test_sync_single_template(self, mock_request):
+        """Fix #8: Test targeted sync_template endpoint."""
+        mock_request.return_value = {"id": "tmpl_id_sync", "status": "REJECTED"}
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import sync_template
+        doc = self._make_template_without_hooks(template_name="test_tmpl_sync_single", status="PENDING")
+        res = sync_template(doc.name)
+        self.assertEqual(res["status"], "REJECTED")
+
+    def test_set_whatsapp_account_resolves_outgoing(self):
+        """Fix #9: Test set_whatsapp_account resolves default outgoing account."""
+        doc = self._make_template_without_hooks(template_name="test_tmpl_acct_outgoing", whatsapp_account="")
+        doc.whatsapp_account = ""
+        doc.set_whatsapp_account()
+        self.assertEqual(doc.whatsapp_account, "Test WA Tmpl Account")
+
+    def test_get_sample_record_single_doctype(self):
+        """Fix #11: Test get_sample_record works with Single DocTypes without throwing SQL errors."""
+        from frappe_whatsapp.frappe_whatsapp.page.template_builder.template_builder import get_sample_record
+        res = get_sample_record("Website Settings", fieldnames=["title_prefix"])
+        self.assertIn("record", res)
+        self.assertEqual(res["record"], "Website Settings")
+
