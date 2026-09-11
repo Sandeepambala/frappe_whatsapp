@@ -12,6 +12,7 @@ import re
 
 import frappe
 from frappe import _
+from frappe.integrations.utils import make_request
 
 from frappe_whatsapp.utils import get_whatsapp_account
 
@@ -292,9 +293,17 @@ def _apply_payload(doc, data):
 	# Buttons — rebuild the child table from scratch.
 	doc.set("buttons", [])
 	for btn in data.get("buttons") or []:
-		button_type = BUTTON_KIND_MAP.get(btn.get("kind"))
+		kind = btn.get("kind")
+		button_type = BUTTON_KIND_MAP.get(kind)
 		if not button_type:
-			continue
+			# Flow / Multi-Product Message / Catalog have no builder equivalent.
+			# Silently dropping them would save a template that looks complete
+			# but has lost a button (the duplicate-an-approved-template path),
+			# so refuse the write and say which type is the problem.
+			frappe.throw(
+				_("Button type {0} cannot be edited in the Template Builder. "
+				  "Edit this template from the WhatsApp Templates form instead.").format(kind or _("(unknown)"))
+			)
 		row = {"button_type": button_type, "button_label": (btn.get("label") or "").strip()}
 		if button_type == "Visit Website":
 			url = (btn.get("url") or "").strip()
@@ -394,31 +403,67 @@ def save_template(payload, submit=0, name=None):
 
 @frappe.whitelist()
 def sync_template(name):
-	"""Refresh Meta status for a single template document."""
+	"""Refresh Meta status for a single template document.
+
+	Returns ``{"name", "status", "synced", "reason"}``. ``synced`` is False when
+	nothing was fetched, with ``reason`` explaining why, so the UI can tell a
+	real refresh apart from a no-op instead of always reporting success.
+	"""
 	if not name:
-		return {"name": None, "status": None}
+		return {"name": None, "status": None, "synced": False, "reason": _("No template specified.")}
+
 	doc = frappe.get_doc("WhatsApp Templates", name)
-	doc.check_permission("read")
-	if not doc.id or not doc.whatsapp_account:
-		return {"name": doc.name, "status": doc.status}
+	# This persists the fetched status, so it is a write, not a read.
+	doc.check_permission("write")
+
+	if not doc.id:
+		return {
+			"name": doc.name,
+			"status": doc.status,
+			"synced": False,
+			"reason": _("This template has not been submitted to Meta yet."),
+		}
+	if not doc.whatsapp_account:
+		return {
+			"name": doc.name,
+			"status": doc.status,
+			"synced": False,
+			"reason": _("This template has no WhatsApp Account set."),
+		}
 
 	account = frappe.get_doc("WhatsApp Account", doc.whatsapp_account)
-	token = account.get_password("token")
-	url = account.url
-	version = account.version
+	headers = {
+		"authorization": f"Bearer {account.get_password('token')}",
+		"content-type": "application/json",
+	}
 
-	headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
 	try:
-		from frappe.integrations.utils import make_request
 		response = make_request(
 			"GET",
-			f"{url}/{version}/{doc.id}",
+			f"{account.url}/{account.version}/{doc.id}?fields=status",
 			headers=headers,
 		)
-		if response and response.get("status"):
-			doc.status = response["status"]
-			doc.db_update()
 	except Exception:
-		pass
+		# Surface the failure instead of reporting a successful no-op — an
+		# expired token or a template deleted on Meta must not look like "ok".
+		frappe.log_error(
+			title="WhatsApp Template status sync failed",
+			message=frappe.get_traceback(),
+		)
+		frappe.throw(
+			_("Could not fetch the status for {0} from Meta. See the Error Log for details.").format(doc.name)
+		)
 
-	return {"name": doc.name, "status": doc.status}
+	status = (response or {}).get("status")
+	if not status:
+		return {
+			"name": doc.name,
+			"status": doc.status,
+			"synced": False,
+			"reason": _("Meta did not return a status for this template."),
+		}
+
+	if status != doc.status:
+		doc.db_set("status", status, update_modified=False)
+
+	return {"name": doc.name, "status": status, "synced": True, "reason": None}

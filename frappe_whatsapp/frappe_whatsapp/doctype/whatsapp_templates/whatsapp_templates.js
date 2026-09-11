@@ -16,10 +16,33 @@ frappe.ui.form.on('WhatsApp Templates', {
 	},
 });
 
+/**
+ * Parse a stored `sample_values` / `field_names` column into a list.
+ *
+ * The column holds a plain comma-separated string, or — when any value itself
+ * contains a comma — a JSON array. Mirrors `parse_list()` in
+ * whatsapp_templates.py; the two formats must stay in sync.
+ */
+function parse_list(val) {
+	if (!val) return [];
+	if (Array.isArray(val)) return val.map((v) => String(v));
+	const s = String(val).trim();
+	if (!s) return [];
+	if (s.startsWith('[') && s.endsWith(']')) {
+		try {
+			const parsed = JSON.parse(s);
+			if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+		} catch (e) {
+			// Not JSON after all (e.g. a literal "[A],B") — fall through to split.
+		}
+	}
+	return s.split(',').map((v) => v.trim());
+}
+
 /** Render the template the way WhatsApp will show it, in a dialog. */
 function show_template_preview(frm) {
 	const d = frm.doc;
-	const samples = (d.sample_values || '').split(',').map((v) => v.trim());
+	const samples = parse_list(d.sample_values);
 
 	// {{1}}, {{2}}, ... -> sample values, keeping the token when none is set.
 	const apply_samples = (text) =>

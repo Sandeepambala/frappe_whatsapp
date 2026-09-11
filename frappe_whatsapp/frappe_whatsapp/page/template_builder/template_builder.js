@@ -105,7 +105,9 @@ class TemplateBuilder {
 		s.body = d.body || '';
 		s.footer = d.footer || '';
 		s.header = { type: (d.header && d.header.type) || 'TEXT', text: (d.header && d.header.text) || '', sample: (d.header && d.header.sample) || '' };
-		s.buttons = (d.buttons || []).map((b) => ({ kind: b.kind, label: b.label || '', url: b.url || '', phone_number: b.phone_number || '', example: b.example || '' }));
+		// `unsupported` must survive hydration: it drives the button-row badge
+		// and blocks duplicating a template the builder cannot round-trip.
+		s.buttons = (d.buttons || []).map((b) => ({ kind: b.kind, label: b.label || '', url: b.url || '', phone_number: b.phone_number || '', example: b.example || '', unsupported: !!b.unsupported }));
 		s.status = d.status || null;
 		s.has_meta_id = !!d.has_meta_id;
 		s.locked = !!d.locked;
@@ -882,7 +884,7 @@ class TemplateBuilder {
 		if (!/^[a-z0-9_]+$/.test(s.template_name.trim())) { frappe.show_alert({ message: __('Template Name may only contain lowercase letters, numbers and underscores'), indicator: 'red' }); return false; }
 		if (!s.body.trim()) { frappe.show_alert({ message: __('Body text is required'), indicator: 'red' }); return false; }
 		if (s.body.length > WA.BODY_MAX) { frappe.show_alert({ message: __('Body exceeds {0} characters', [WA.BODY_MAX]), indicator: 'red' }); return false; }
-		
+
 		const vars = this.detectVars(s.body);
 		if (!this.isContiguousVars(vars)) {
 			frappe.show_alert({ message: __('Variables must be numbered consecutively starting at {{1}} (e.g. {{1}}, {{2}})'), indicator: 'red' });
@@ -997,6 +999,19 @@ class TemplateBuilder {
 
 	/** Copy an approved (locked) template into a fresh, editable draft. */
 	duplicateTemplate() {
+		// A Flow / Multi-Product Message / Catalog button has no builder
+		// equivalent, so the copy would come out silently missing it. Refuse
+		// rather than hand back a template that looks complete but is not.
+		const unsupported = (this.state.buttons || []).filter((b) => b.unsupported);
+		if (unsupported.length) {
+			frappe.msgprint({
+				title: __('Cannot duplicate here'),
+				indicator: 'orange',
+				message: __('This template uses button types the builder cannot edit ({0}). Duplicate it from the WhatsApp Templates form so the buttons are preserved.',
+					[unsupported.map((b) => b.kind).join(', ')]),
+			});
+			return;
+		}
 		const copy = JSON.parse(JSON.stringify(this.state));
 		copy.status = null;
 		copy.has_meta_id = false;
@@ -1028,14 +1043,21 @@ class TemplateBuilder {
 		if (!this.editName) return;
 		frappe.dom.freeze(__('Syncing status from Meta…'));
 		try {
-			await frappe.call({
+			const res = await frappe.call({
 				method: `${WA.API}.sync_template`,
 				args: { name: this.editName },
-			});
+			}).then((r) => r.message || {});
 			await this.openTemplate(this.editName, { quiet: true });
-			frappe.show_alert({ message: __('Status refreshed'), indicator: 'green' }, 3);
+			// Distinguish a real refresh from a no-op; a server-side failure
+			// throws and is handled below rather than reported as success.
+			if (res.synced) {
+				frappe.show_alert({ message: __('Status refreshed: {0}', [res.status]), indicator: 'green' }, 3);
+			} else {
+				frappe.show_alert({ message: res.reason || __('Nothing to sync'), indicator: 'orange' }, 5);
+			}
 		} catch (e) {
 			console.error(e);
+			frappe.show_alert({ message: __('Could not refresh status from Meta'), indicator: 'red' }, 5);
 		} finally {
 			frappe.dom.unfreeze();
 		}
