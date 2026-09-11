@@ -14,7 +14,31 @@ class TestWhatsAppTemplates(IntegrationTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # setUp() clears the default flags on every WhatsApp Account so the
+        # test account is unambiguously the default. On a site that already has
+        # real accounts that is destructive, so snapshot the flags here and put
+        # them back in tearDownClass.
+        cls._account_defaults = frappe.get_all(
+            "WhatsApp Account",
+            fields=["name", "is_default_incoming", "is_default_outgoing"],
+        )
         cls._ensure_test_account()
+
+    @classmethod
+    def tearDownClass(cls):
+        for row in getattr(cls, "_account_defaults", []):
+            if frappe.db.exists("WhatsApp Account", row.name):
+                frappe.db.set_value(
+                    "WhatsApp Account",
+                    row.name,
+                    {
+                        "is_default_incoming": row.is_default_incoming,
+                        "is_default_outgoing": row.is_default_outgoing,
+                    },
+                    update_modified=False,
+                )
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit -- restore site config the fixtures overwrote
+        super().tearDownClass()
 
     @classmethod
     def _ensure_test_account(cls):
@@ -39,8 +63,12 @@ class TestWhatsAppTemplates(IntegrationTestCase):
         # Set password within each test's transaction scope
         from frappe.utils.password import set_encrypted_password
         set_encrypted_password("WhatsApp Account", "Test WA Tmpl Account", "test_tmpl_token", "token")
-        # Clear ALL defaults then set ours (db.set_value bypasses on_update hooks)
-        frappe.db.sql("UPDATE `tabWhatsApp Account` SET is_default_outgoing=0, is_default_incoming=0")
+        # Clear defaults on OTHER accounts then set ours (db.set_value bypasses
+        # on_update hooks). tearDownClass restores the original flags.
+        frappe.db.sql(
+            "UPDATE `tabWhatsApp Account` SET is_default_outgoing=0, is_default_incoming=0 WHERE name != %s",
+            "Test WA Tmpl Account",
+        )
         frappe.db.set_value("WhatsApp Account", "Test WA Tmpl Account", {
             "is_default_outgoing": 1,
             "is_default_incoming": 1,
